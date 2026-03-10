@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -61,7 +61,7 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant with access to tools.\n"
@@ -295,7 +295,7 @@ class ContextGuard:
                             rc = block.get("content", "")
                             if isinstance(rc, str):
                                 total += self.estimate_tokens(rc)
-                        elif block.get("type") == "tool_use":
+                        elif block.get("type") == "tool_calls":
                             total += self.estimate_tokens(
                                 json.dumps(block.get("input", {}))
                             )
@@ -367,7 +367,7 @@ class ContextGuard:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
                             parts.append(f"[{role}]: {block['text']}")
-                        elif block.get("type") == "tool_use":
+                        elif block.get("type") == "tool_calls":
                             parts.append(
                                 f"[{role} called {block.get('name', '?')}]: "
                                 f"{json.dumps(block.get('input', {}), ensure_ascii=False)}"
@@ -388,7 +388,7 @@ class ContextGuard:
         )
 
         try:
-            summary_resp = api_client.messages.create(
+            summary_resp = api_client.chat.completions.create(
                 model=model,
                 max_tokens=2048,
                 system="You are a conversation summarizer. Be concise and factual.",
@@ -681,7 +681,7 @@ class ResilienceRunner:
 
             api_client = Anthropic(
                 api_key=profile.api_key,
-                base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+                base_url=os.getenv("DASHSCOPE_BASE_URL") or None,
             )
 
             # ---- LAYER 2: Overflow Recovery ----
@@ -784,7 +784,7 @@ class ResilienceRunner:
 
                 api_client = Anthropic(
                     api_key=profile.api_key,
-                    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+                    base_url=os.getenv("DASHSCOPE_BASE_URL") or None,
                 )
 
                 try:
@@ -835,7 +835,7 @@ class ResilienceRunner:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = api_client.messages.create(
+            response = api_client.chat.completions.create(
                 model=model,
                 max_tokens=8096,
                 system=system,
@@ -845,16 +845,16 @@ class ResilienceRunner:
 
             current_messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": response.choices[0].message.content,
             })
 
-            if response.stop_reason == "end_turn":
+            if response.choices[0].finish_reason == "stop":
                 return response, current_messages
 
-            elif response.stop_reason == "tool_use":
+            elif response.choices[0].finish_reason == "tool_calls":
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
+                for block in response.choices[0].message.content:
+                    if block.type != "tool_calls":
                         continue
                     result = process_tool_call(block.name, block.input)
                     tool_results.append({
@@ -992,8 +992,8 @@ def handle_repl_command(
 def agent_loop() -> None:
     """带弹性运行器的主 agent 循环."""
 
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    base_url = os.getenv("ANTHROPIC_BASE_URL") or None
+    api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    base_url = os.getenv("DASHSCOPE_BASE_URL") or None
 
     # Create demo profiles. In production, each would have a different key.
     # Here we use the same key for all three to keep the demo self-contained.
@@ -1087,7 +1087,7 @@ def agent_loop() -> None:
 
             # Extract and print assistant text
             assistant_text = ""
-            for block in response.content:
+            for block in response.choices[0].message.content:
                 if hasattr(block, "text"):
                     assistant_text += block.text
             if assistant_text:
@@ -1114,7 +1114,7 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("DASHSCOPE_API_KEY"):
         print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)

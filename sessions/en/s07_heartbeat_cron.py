@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from anthropic import Anthropic
+from openai import OpenAI
 from croniter import croniter
 from dotenv import load_dotenv
 
@@ -40,10 +40,10 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 CRON_DIR = WORKSPACE_DIR / "cron"
@@ -604,9 +604,10 @@ def agent_loop() -> None:
             messages.append({"role": "user", "content": user_input})
             while True:
                 try:
-                    response = client.messages.create(
-                        model=MODEL_ID, max_tokens=8096, system=system_prompt,
-                        tools=MEMORY_TOOLS, messages=messages,
+                    api_messages = [{"role": "system", "content": system_prompt}] + messages
+                    response = client.chat.completions.create(
+                        model=MODEL_ID, max_tokens=8096,
+                        tools=MEMORY_TOOLS, messages=api_messages,
                     )
                 except Exception as exc:
                     print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
@@ -616,25 +617,28 @@ def agent_loop() -> None:
                         messages.pop()
                     break
 
-                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "assistant", "content": response.choices[0].message.content})
 
-                if response.stop_reason == "end_turn":
-                    text = "".join(b.text for b in response.content if hasattr(b, "text"))
+                if response.choices[0].finish_reason == "stop":
+                    text = response.choices[0].message.content or ""
                     if text:
                         print_assistant(text)
                     break
-                elif response.stop_reason == "tool_use":
+                elif response.choices[0].finish_reason == "tool_calls":
                     results = []
-                    for block in response.content:
-                        if block.type != "tool_use":
-                            continue
-                        print_info(f"  [tool: {block.name}]")
-                        results.append({"type": "tool_result", "tool_use_id": block.id,
-                                        "content": handle_tool(block.name, block.input)})
-                    messages.append({"role": "user", "content": results})
+                    tool_calls = response.choices[0].message.tool_calls
+                    if tool_calls:
+                        for tool_call in tool_calls:
+                            print_info(f"  [tool: {tool_call.function.name}]")
+                            results.append({"role": "tool", "tool_call_id": tool_call.id,
+                                            "content": handle_tool(
+                                                tool_call.function.name,
+                                                json.loads(tool_call.function.arguments)
+                                            )})
+                        messages.extend(results)
                 else:
-                    print_info(f"[stop_reason={response.stop_reason}]")
-                    text = "".join(b.text for b in response.content if hasattr(b, "text"))
+                    print_info(f"[finish_reason={response.choices[0].finish_reason}]")
+                    text = response.choices[0].message.content or ""
                     if text:
                         print_assistant(text)
                     break
@@ -649,8 +653,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
     agent_loop()

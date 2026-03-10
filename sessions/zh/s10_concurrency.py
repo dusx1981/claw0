@@ -44,7 +44,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -53,9 +53,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
 MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 
@@ -334,11 +334,11 @@ def run_agent_single_turn(prompt: str, system_prompt: str | None = None) -> str:
     """单轮 LLM 调用, 无工具, 返回纯文本."""
     sys_prompt = system_prompt or "You are a helpful assistant performing a background check."
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL_ID, max_tokens=2048, system=sys_prompt,
             messages=[{"role": "user", "content": prompt}],
         )
-        return "".join(b.text for b in response.content if hasattr(b, "text")).strip()
+        return "".join(b.text for b in response.choices[0].message.content if hasattr(b, "text")).strip()
     except Exception as exc:
         return f"[agent error: {exc}]"
 
@@ -824,7 +824,7 @@ def agent_loop() -> None:
                 final_text = ""
                 while True:
                     try:
-                        response = client.messages.create(
+                        response = client.chat.completions.create(
                             model=MODEL_ID, max_tokens=8096, system=sys_prompt,
                             tools=MEMORY_TOOLS, messages=msgs,
                         )
@@ -835,17 +835,17 @@ def agent_loop() -> None:
                             msgs.pop()
                         return f"[API Error: {exc}]"
 
-                    msgs.append({"role": "assistant", "content": response.content})
+                    msgs.append({"role": "assistant", "content": response.choices[0].message.content})
 
-                    if response.stop_reason == "end_turn":
+                    if response.choices[0].finish_reason == "stop":
                         final_text = "".join(
-                            b.text for b in response.content if hasattr(b, "text")
+                            b.text for b in response.choices[0].message.content if hasattr(b, "text")
                         )
                         break
-                    elif response.stop_reason == "tool_use":
+                    elif response.choices[0].finish_reason == "tool_calls":
                         results = []
-                        for block in response.content:
-                            if block.type != "tool_use":
+                        for block in response.choices[0].message.content:
+                            if block.type != "tool_calls":
                                 continue
                             print_info(f"  [tool: {block.name}]")
                             results.append({
@@ -856,7 +856,7 @@ def agent_loop() -> None:
                         msgs.append({"role": "user", "content": results})
                     else:
                         final_text = "".join(
-                            b.text for b in response.content if hasattr(b, "text")
+                            b.text for b in response.choices[0].message.content if hasattr(b, "text")
                         )
                         break
                 return final_text
@@ -889,7 +889,7 @@ def agent_loop() -> None:
 
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("DASHSCOPE_API_KEY"):
         print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)

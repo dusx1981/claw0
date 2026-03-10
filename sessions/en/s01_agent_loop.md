@@ -105,8 +105,8 @@ but the scaffolding means Section 02 requires zero changes to the outer loop.
 
 ```sh
 # Make sure .env has your key
-echo 'ANTHROPIC_API_KEY=sk-ant-xxxxx' > .env
-echo 'MODEL_ID=claude-sonnet-4-20250514' >> .env
+echo 'DASHSCOPE_API_KEY=sk-ant-xxxxx' > .env
+echo 'MODEL_ID=qwen-plus' >> .env
 
 # Run the agent
 python en/s01_agent_loop.py

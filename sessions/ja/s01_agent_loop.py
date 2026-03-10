@@ -1,10 +1,10 @@
 """
 Section 01: エージェントループ
-「エージェントとは while True + stop_reason のことである」
+「エージェントとは while True + finish_reason のことである」
 
-    ユーザー入力 --> [messages[]] --> LLM API --> stop_reason?
+    ユーザー入力 --> [messages[]] --> LLM API --> finish_reason?
                                                 /        \
-                                          "end_turn"  "tool_use"
+                                          "stop"  "tool_calls"
                                               |           |
                                            表示      (次のセクション)
 
@@ -13,8 +13,8 @@ Section 01: エージェントループ
     python ja/s01_agent_loop.py
 
 .env に必要な設定:
-    ANTHROPIC_API_KEY=sk-ant-xxxxx
-    MODEL_ID=claude-sonnet-4-20250514
+    DASHSCOPE_API_KEY=sk-xxxxx
+    MODEL_ID=qwen-plus
 """
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -33,10 +33,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 SYSTEM_PROMPT = "You are a helpful AI assistant. Answer questions directly."
@@ -111,50 +111,45 @@ def agent_loop() -> None:
 
         # --- LLM を呼び出す ---
         try:
-            response = client.messages.create(
+            api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+            response = client.chat.completions.create(
                 model=MODEL_ID,
                 max_tokens=8096,
-                system=SYSTEM_PROMPT,
-                messages=messages,
+                messages=api_messages,
             )
         except Exception as exc:
-            print(f"\n{YELLOW}API エラー: {exc}{RESET}\n")
+            print(f"\n{YELLOW}API エラー：{exc}{RESET}\n")
             messages.pop()
             continue
 
-        # --- stop_reason を確認 ---
-        if response.stop_reason == "end_turn":
-            assistant_text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    assistant_text += block.text
+        # --- finish_reason を確認 ---
+        if response.choices[0].finish_reason == "stop":
+            assistant_text = response.choices[0].message.content or ""
 
             print_assistant(assistant_text)
 
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_text,
             })
 
-        elif response.stop_reason == "tool_use":
-            print_info("[stop_reason=tool_use] このセクションにはツールがありません。")
+        elif response.choices[0].finish_reason == "tool_calls":
+            print_info("[finish_reason=tool_calls] このセクションにはツールがありません。")
             print_info("ツール対応は s02_tool_use.py を参照してください。")
+            assistant_text = response.choices[0].message.content or ""
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_text,
             })
 
         else:
-            print_info(f"[stop_reason={response.stop_reason}]")
-            assistant_text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    assistant_text += block.text
+            print_info(f"[finish_reason={response.choices[0].finish_reason}]")
+            assistant_text = response.choices[0].message.content or ""
             if assistant_text:
                 print_assistant(assistant_text)
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_text,
             })
 
 
@@ -163,8 +158,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}エラー: ANTHROPIC_API_KEY が設定されていません。{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}エラー：DASHSCOPE_API_KEY が設定されていません。{RESET}")
         print(f"{DIM}.env.example を .env にコピーして API キーを記入してください。{RESET}")
         sys.exit(1)
 

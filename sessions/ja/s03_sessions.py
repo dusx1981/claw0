@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -48,10 +48,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 SYSTEM_PROMPT = (
@@ -383,7 +383,7 @@ class ContextGuard:
         return head + f"\n\n[... truncated ({len(result)} chars total, showing first {len(head)}) ...]"
 
     def compact_history(self, messages: list[dict],
-                        api_client: Anthropic, model: str) -> list[dict]:
+                        api_client: OpenAI, model: str) -> list[dict]:
         """
         メッセージの先頭50%をLLM生成の要約に圧縮する。
         最後のNメッセージ (N = max(4, 全体の20%)) はそのまま保持する。
@@ -412,16 +412,13 @@ class ContextGuard:
         )
 
         try:
-            summary_resp = api_client.messages.create(
+            summary_messages = [{"role": "system", "content": "You are a conversation summarizer. Be concise and factual."}, {"role": "user", "content": summary_prompt}]
+            summary_resp = api_client.chat.completions.create(
                 model=model,
                 max_tokens=2048,
-                system="You are a conversation summarizer. Be concise and factual.",
-                messages=[{"role": "user", "content": summary_prompt}],
+                messages=summary_messages,
             )
-            summary_text = ""
-            for block in summary_resp.content:
-                if hasattr(block, "text"):
-                    summary_text += block.text
+            summary_text = summary_resp.choices[0].message.content or ""
 
             print_session(
                 f"  [compact] {len(old_messages)} messages -> summary "
@@ -467,7 +464,7 @@ class ContextGuard:
 
     def guard_api_call(
         self,
-        api_client: Anthropic,
+        api_client: OpenAI,
         model: str,
         system: str,
         messages: list[dict],
@@ -484,15 +481,29 @@ class ContextGuard:
 
         for attempt in range(max_retries + 1):
             try:
+                api_messages = [{"role": "system", "content": system}] + current_messages
                 kwargs: dict[str, Any] = {
                     "model": model,
                     "max_tokens": 8096,
-                    "system": system,
-                    "messages": current_messages,
+                    "messages": api_messages,
                 }
                 if tools:
-                    kwargs["tools"] = tools
-                result = api_client.messages.create(**kwargs)
+                    # 转换工具格式为 OpenAI 格式
+                    openai_tools = []
+                    for tool in tools:
+                        if "name" in tool and "input_schema" in tool:
+                            openai_tools.append({
+                                "type": "function",
+                                "function": {
+                                    "name": tool["name"],
+                                    "description": tool.get("description", ""),
+                                    "parameters": tool["input_schema"],
+                                },
+                            })
+                        else:
+                            openai_tools.append(tool)
+                    kwargs["tools"] = openai_tools
+                result = api_client.chat.completions.create(**kwargs)
                 if current_messages is not messages:
                     messages.clear()
                     messages.extend(current_messages)
@@ -818,51 +829,49 @@ def agent_loop() -> None:
 
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": response.choices[0].message.content,
             })
 
-            # JSONL保存用にコンテンツブロックをシリアライズ
+            # JSONL 保存用にコンテンツをシリアライズ
+            assistant_message = response.choices[0].message
             serialized_content = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    serialized_content.append({"type": "text", "text": block.text})
-                elif block.type == "tool_use":
+            if assistant_message.content:
+                serialized_content.append({"type": "text", "text": assistant_message.content})
+            if assistant_message.tool_calls:
+                for tc in assistant_message.tool_calls:
                     serialized_content.append({
                         "type": "tool_use",
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input,
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": tc.function.arguments,
                     })
             store.save_turn("assistant", serialized_content)
 
-            if response.stop_reason == "end_turn":
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+            if response.choices[0].finish_reason == "stop":
+                assistant_text = assistant_message.content or ""
                 if assistant_text:
                     print_assistant(assistant_text)
                 break
 
-            elif response.stop_reason == "tool_use":
+            elif response.choices[0].finish_reason == "tool_calls":
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    result = process_tool_call(block.name, block.input)
+                for tc in assistant_message.tool_calls or []:
+                    import json
+                    try:
+                        tool_input = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        tool_input = {}
+                    result = process_tool_call(tc.function.name, tool_input)
                     store.save_tool_result(
-                        block.id, block.name, block.input, result
+                        tc.id, tc.function.name, tool_input, result
                     )
                     tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "role": "tool",
+                        "tool_call_id": tc.id,
                         "content": result,
                     })
 
-                messages.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
+                messages.extend(tool_results)
                 continue
 
             else:
@@ -881,8 +890,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
 

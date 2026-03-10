@@ -13,8 +13,8 @@ Section 01: Agent 循环
     python zh/s01_agent_loop.py
 
 需要在 .env 中配置:
-    ANTHROPIC_API_KEY=sk-ant-xxxxx
-    MODEL_ID=claude-sonnet-4-20250514
+    DASHSCOPE_API_KEY=sk-xxxxx
+    MODEL_ID=qwen-plus
 """
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -33,10 +33,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 SYSTEM_PROMPT = "You are a helpful AI assistant. Answer questions directly."
@@ -111,50 +111,45 @@ def agent_loop() -> None:
 
         # --- 调用 LLM ---
         try:
-            response = client.messages.create(
+            api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+            response = client.chat.completions.create(
                 model=MODEL_ID,
                 max_tokens=8096,
-                system=SYSTEM_PROMPT,
-                messages=messages,
+                messages=api_messages,
             )
         except Exception as exc:
             print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
             messages.pop()
             continue
 
-        # --- 检查 stop_reason ---
-        if response.stop_reason == "end_turn":
-            assistant_text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    assistant_text += block.text
+        # --- 检查 finish_reason ---
+        finish_reason = response.choices[0].finish_reason
+        assistant_message = response.choices[0].message
+        assistant_text = assistant_message.content or ""
 
+        if finish_reason == "stop":
             print_assistant(assistant_text)
 
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_text,
             })
 
-        elif response.stop_reason == "tool_use":
-            print_info("[stop_reason=tool_use] 本节没有可用工具.")
+        elif finish_reason == "tool_calls":
+            print_info("[finish_reason=tool_calls] 本节没有可用工具.")
             print_info("参见 s02_tool_use.py 了解工具支持.")
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_text,
             })
 
         else:
-            print_info(f"[stop_reason={response.stop_reason}]")
-            assistant_text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    assistant_text += block.text
+            print_info(f"[finish_reason={finish_reason}]")
             if assistant_text:
                 print_assistant(assistant_text)
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_text,
             })
 
 
@@ -163,8 +158,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY 未设置.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY 未设置.{RESET}")
         print(f"{DIM}将 .env.example 复制为 .env 并填入你的 key.{RESET}")
         sys.exit(1)
 

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 try:
     import httpx
@@ -37,9 +37,9 @@ except ImportError:
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
 MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -520,14 +520,16 @@ def tool_memory_search(query: str) -> str:
         return f"Error: {exc}"
 
 TOOLS = [
-    {"name": "memory_write", "description": "Save a note to long-term memory.",
-     "input_schema": {"type": "object", "required": ["content"],
-                      "properties": {"content": {"type": "string",
-                                                  "description": "The text to remember."}}}},
-    {"name": "memory_search", "description": "Search through saved memory notes.",
-     "input_schema": {"type": "object", "required": ["query"],
-                      "properties": {"query": {"type": "string",
-                                               "description": "Search keyword."}}}},
+    {"type": "function", "function": {
+        "name": "memory_write", "description": "Save a note to long-term memory.",
+        "parameters": {"type": "object", "required": ["content"],
+                       "properties": {"content": {"type": "string",
+                                                   "description": "The text to remember."}}}},},
+    {"type": "function", "function": {
+        "name": "memory_search", "description": "Search through saved memory notes.",
+        "parameters": {"type": "object", "required": ["query"],
+                       "properties": {"query": {"type": "string",
+                                                "description": "Search keyword."}}}},},
 ]
 
 TOOL_HANDLERS: dict[str, Any] = {
@@ -627,9 +629,10 @@ def run_agent_turn(
 
     while True:
         try:
-            response = client.messages.create(
+            api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+            response = client.chat.completions.create(
                 model=MODEL_ID, max_tokens=8096,
-                system=SYSTEM_PROMPT, tools=TOOLS, messages=messages,
+                tools=TOOLS, messages=api_messages,
             )
         except Exception as exc:
             print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
@@ -639,32 +642,59 @@ def run_agent_turn(
                 messages.pop()
             return
 
-        messages.append({"role": "assistant", "content": response.content})
+        assistant_message = response.choices[0].message
+        assistant_text = assistant_message.content or ""
+        tool_calls = assistant_message.tool_calls or []
+        
+        if assistant_text:
+            messages.append({"role": "assistant", "content": assistant_text})
 
-        if response.stop_reason == "end_turn":
-            text = "".join(b.text for b in response.content if hasattr(b, "text"))
-            if text:
+        finish_reason = response.choices[0].finish_reason
+
+        if finish_reason == "stop":
+            if assistant_text:
                 ch = mgr.get(inbound.channel)
                 if ch:
-                    ch.send(inbound.peer_id, text)
+                    ch.send(inbound.peer_id, assistant_text)
                 else:
-                    print_assistant(text, inbound.channel)
+                    print_assistant(assistant_text, inbound.channel)
             break
-        elif response.stop_reason == "tool_use":
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    results.append({
-                        "type": "tool_result", "tool_use_id": block.id,
-                        "content": process_tool_call(block.name, block.input),
-                    })
-            messages.append({"role": "user", "content": results})
+        elif finish_reason == "tool_calls" and tool_calls:
+            import json
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    function_args = {}
+                
+                result = process_tool_call(function_name, function_args)
+                
+                # 添加工具调用消息
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": tool_call.function.arguments,
+                        },
+                    }],
+                })
+                
+                # 添加工具结果
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
         else:
-            text = "".join(b.text for b in response.content if hasattr(b, "text"))
-            if text:
+            if assistant_text:
                 ch = mgr.get(inbound.channel)
                 if ch:
-                    ch.send(inbound.peer_id, text)
+                    ch.send(inbound.peer_id, assistant_text)
             break
 
 # ---------------------------------------------------------------------------
@@ -770,7 +800,7 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("DASHSCOPE_API_KEY"):
         print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)

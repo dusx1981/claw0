@@ -85,7 +85,8 @@ pip install -r requirements.txt
 
 # 3. Configure
 cp .env.example .env
-# Edit .env: set ANTHROPIC_API_KEY and MODEL_ID
+# Edit .env: set DASHSCOPE_API_KEY and MODEL_ID
+# Get API Key from Alibaba Cloud Bailian: https://bailian.console.aliyun.com/
 
 # 4. Run any section (pick your language)
 python sessions/en/s01_agent_loop.py    # English
@@ -154,12 +155,12 @@ Each language folder is self-contained: runnable Python code + documentation sid
 ## Prerequisites
 
 - Python 3.11+
-- An API key for Anthropic (or compatible provider)
+- An API key for Alibaba Cloud Bailian (for Qwen models)
 
 ## Dependencies
 
 ```
-anthropic>=0.39.0
+openai>=1.0.0
 python-dotenv>=1.0.0
 websockets>=12.0
 croniter>=2.0.0

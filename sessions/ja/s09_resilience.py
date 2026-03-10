@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -62,7 +62,7 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant with access to tools.\n"

@@ -29,8 +29,8 @@ Agent 循环本身没变 -- 我们只是加了一张调度表.
     python zh/s02_tool_use.py
 
 需要在 .env 中配置:
-    ANTHROPIC_API_KEY=sk-ant-xxxxx
-    MODEL_ID=claude-sonnet-4-20250514
+    DASHSCOPE_API_KEY=sk-xxxxx
+    MODEL_ID=qwen-plus
 """
 
 # ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -51,10 +51,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 SYSTEM_PROMPT = (
@@ -236,85 +236,97 @@ def tool_edit_file(file_path: str, old_string: str, new_string: str) -> str:
 
 TOOLS = [
     {
-        "name": "bash",
-        "description": (
-            "Run a shell command and return its output. "
-            "Use for system commands, git, package managers, etc."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute.",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": (
+                "Run a shell command and return its output. "
+                "Use for system commands, git, package managers, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds. Default 30.",
+                    },
                 },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds. Default 30.",
-                },
+                "required": ["command"],
             },
-            "required": ["command"],
         },
     },
     {
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to working directory).",
+                    },
                 },
+                "required": ["file_path"],
             },
-            "required": ["file_path"],
         },
     },
     {
-        "name": "write_file",
-        "description": (
-            "Write content to a file. Creates parent directories if needed. "
-            "Overwrites existing content."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write content to a file. Creates parent directories if needed. "
+                "Overwrites existing content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to working directory).",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write.",
+                    },
                 },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write.",
-                },
+                "required": ["file_path", "content"],
             },
-            "required": ["file_path", "content"],
         },
     },
     {
-        "name": "edit_file",
-        "description": (
-            "Replace an exact string in a file with a new string. "
-            "The old_string must appear exactly once in the file. "
-            "Always read the file first to get the exact text to replace."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace an exact string in a file with a new string. "
+                "The old_string must appear exactly once in the file. "
+                "Always read the file first to get the exact text to replace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to working directory).",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to find and replace. Must be unique.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement text.",
+                    },
                 },
-                "old_string": {
-                    "type": "string",
-                    "description": "The exact text to find and replace. Must be unique.",
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The replacement text.",
-                },
+                "required": ["file_path", "old_string", "new_string"],
             },
-            "required": ["file_path", "old_string", "new_string"],
         },
     },
 ]
@@ -399,15 +411,15 @@ def agent_loop() -> None:
 
         # --- Step 3: Agent 内循环 ---
         # 模型可能连续调用多个工具才最终给出文本回复.
-        # 所以我们用 while True 循环, 直到 stop_reason != "tool_use"
+        # 所以我们用 while True 循环，直到 finish_reason != "tool_calls"
         while True:
             try:
-                response = client.messages.create(
+                api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+                response = client.chat.completions.create(
                     model=MODEL_ID,
                     max_tokens=8096,
-                    system=SYSTEM_PROMPT,
                     tools=TOOLS,
-                    messages=messages,
+                    messages=api_messages,
                 )
             except Exception as exc:
                 print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
@@ -416,6 +428,79 @@ def agent_loop() -> None:
                     messages.pop()
                 if messages:
                     messages.pop()
+                break
+
+            # 获取 assistant 消息
+            assistant_message = response.choices[0].message
+            assistant_text = assistant_message.content or ""
+            tool_calls = assistant_message.tool_calls
+
+            # 追加 assistant 回复到历史
+            if assistant_text:
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_text,
+                })
+
+            # --- 检查 finish_reason ---
+            finish_reason = response.choices[0].finish_reason
+
+            if finish_reason == "stop":
+                # 模型说完了，提取文本打印
+                if assistant_text:
+                    print_assistant(assistant_text)
+                # 跳出内循环，等待下一次用户输入
+                break
+
+            elif finish_reason == "tool_calls" and tool_calls:
+                # 模型想调用工具
+                print_info(f"[tool_calls: {len(tool_calls)}]")
+                
+                # 处理每个工具调用
+                for tool_call in tool_calls:
+                    function_name = tool_call.function.name
+                    # 解析 JSON 参数
+                    import json
+                    try:
+                        function_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        function_args = {}
+                    
+                    # 执行工具
+                    result = process_tool_call(function_name, function_args)
+                    print_tool(function_name, str(function_args))
+
+                    # 将工具调用和结果追加到消息历史
+                    # OpenAI 格式：先追加 assistant 的 tool_calls 消息
+                    if not any(msg.get("role") == "assistant" and msg.get("tool_calls") for msg in messages):
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": function_name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }],
+                        })
+                    
+                    # 添加工具结果
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    })
+
+                # 继续内循环 -- 模型会看到工具结果并决定下一步
+                continue
+
+            else:
+                # max_tokens 或其他情况
+                print_info(f"[finish_reason={finish_reason}]")
+                if assistant_text:
+                    print_assistant(assistant_text)
                 break
 
             # 追加 assistant 回复到历史
@@ -480,8 +565,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY 未设置.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY 未设置.{RESET}")
         print(f"{DIM}将 .env.example 复制为 .env 并填入你的 key.{RESET}")
         sys.exit(1)
 

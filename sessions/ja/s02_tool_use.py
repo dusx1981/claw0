@@ -5,15 +5,15 @@ Section 02: ツール使用
 エージェントループは s01 から変更なし。追加点のみ:
   1. TOOLS 配列がモデルに利用可能なツールを伝える (JSON スキーマ)
   2. TOOL_HANDLERS 辞書がツール名を Python 関数にマッピング
-  3. stop_reason == "tool_use" のとき、dispatch して結果を返す
+  3. finish_reason == "tool_calls" のとき、dispatch して結果を返す
 
-    ユーザー --> LLM --> stop_reason == "tool_use"?
+    ユーザー --> LLM --> finish_reason == "tool_calls"?
                           |
-                  TOOL_HANDLERS[name](**input)
+                   TOOL_HANDLERS[name](**input)
                           |
                   tool_result --> LLM に返す
                           |
-                   stop_reason == "end_turn"? --> 表示
+                   finish_reason == "stop"? --> 表示
 
 ツール:
     - bash        : シェルコマンドを実行
@@ -26,8 +26,8 @@ Section 02: ツール使用
     python ja/s02_tool_use.py
 
 .env に必要な設定:
-    ANTHROPIC_API_KEY=sk-ant-xxxxx
-    MODEL_ID=claude-sonnet-4-20250514
+    DASHSCOPE_API_KEY=sk-xxxxx
+    MODEL_ID=qwen-plus
 """
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -48,10 +48,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 SYSTEM_PROMPT = (
@@ -208,91 +208,103 @@ def tool_edit_file(file_path: str, old_string: str, new_string: str) -> str:
 # ---------------------------------------------------------------------------
 # ツールスキーマ + dispatch テーブル
 # ---------------------------------------------------------------------------
-# TOOLS = モデルに利用可能なものを伝える (JSON スキーマ)
+# TOOLS = モデルに利用可能なものを伝える (OpenAI 形式)
 # TOOL_HANDLERS = コード側で何を呼び出すかを定義 (名前 -> 関数)
 # ---------------------------------------------------------------------------
 
 TOOLS = [
     {
-        "name": "bash",
-        "description": (
-            "Run a shell command and return its output. "
-            "Use for system commands, git, package managers, etc."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute.",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": (
+                "Run a shell command and return its output. "
+                "Use for system commands, git, package managers, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds. Default 30.",
+                    },
                 },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds. Default 30.",
-                },
+                "required": ["command"],
             },
-            "required": ["command"],
         },
     },
     {
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to working directory).",
+                    },
                 },
+                "required": ["file_path"],
             },
-            "required": ["file_path"],
         },
     },
     {
-        "name": "write_file",
-        "description": (
-            "Write content to a file. Creates parent directories if needed. "
-            "Overwrites existing content."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write content to a file. Creates parent directories if needed. "
+                "Overwrites existing content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to working directory).",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write.",
+                    },
                 },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write.",
-                },
+                "required": ["file_path", "content"],
             },
-            "required": ["file_path", "content"],
         },
     },
     {
-        "name": "edit_file",
-        "description": (
-            "Replace an exact string in a file with a new string. "
-            "The old_string must appear exactly once in the file. "
-            "Always read the file first to get the exact text to replace."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file (relative to working directory).",
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace an exact string in a file with a new string. "
+                "The old_string must appear exactly once in the file. "
+                "Always read the file first to get the exact text to replace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to working directory).",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to find and replace. Must be unique.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement text.",
+                    },
                 },
-                "old_string": {
-                    "type": "string",
-                    "description": "The exact text to find and replace. Must be unique.",
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The replacement text.",
-                },
+                "required": ["file_path", "old_string", "new_string"],
             },
-            "required": ["file_path", "old_string", "new_string"],
         },
     },
 ]
@@ -369,12 +381,12 @@ def agent_loop() -> None:
         # --- 内部ループ: モデルが複数のツール呼び出しを連鎖させる場合がある ---
         while True:
             try:
-                response = client.messages.create(
+                api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+                response = client.chat.completions.create(
                     model=MODEL_ID,
                     max_tokens=8096,
-                    system=SYSTEM_PROMPT,
                     tools=TOOLS,
-                    messages=messages,
+                    messages=api_messages,
                 )
             except Exception as exc:
                 print(f"\n{YELLOW}API エラー: {exc}{RESET}\n")
@@ -384,45 +396,53 @@ def agent_loop() -> None:
                     messages.pop()
                 break
 
+            # アシスタントメッセージを処理
+            assistant_message = response.choices[0].message
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": assistant_message.content,
             })
+            
+            # tool_calls があれば保存
+            if assistant_message.tool_calls:
+                for tc in assistant_message.tool_calls:
+                    messages[-1].setdefault("tool_calls", []).append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    })
 
-            if response.stop_reason == "end_turn":
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+            if response.choices[0].finish_reason == "stop":
+                assistant_text = assistant_message.content or ""
                 if assistant_text:
                     print_assistant(assistant_text)
                 break
 
-            elif response.stop_reason == "tool_use":
+            elif response.choices[0].finish_reason == "tool_calls":
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    result = process_tool_call(block.name, block.input)
+                for tc in assistant_message.tool_calls or []:
+                    import json
+                    try:
+                        tool_input = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        tool_input = {}
+                    result = process_tool_call(tc.function.name, tool_input)
                     tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "role": "tool",
+                        "tool_call_id": tc.id,
                         "content": result,
                     })
 
-                # ツール結果はユーザーメッセージに入れる (Anthropic API の要件)
-                messages.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
+                # ツール結果をメッセージに追加
+                messages.extend(tool_results)
                 continue
 
             else:
-                print_info(f"[stop_reason={response.stop_reason}]")
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+                print_info(f"[finish_reason={response.choices[0].finish_reason}]")
+                assistant_text = assistant_message.content or ""
                 if assistant_text:
                     print_assistant(assistant_text)
                 break
@@ -433,8 +453,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}エラー: ANTHROPIC_API_KEY が設定されていません。{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}エラー：DASHSCOPE_API_KEY が設定されていません。{RESET}")
         print(f"{DIM}.env.example を .env にコピーして API キーを記入してください。{RESET}")
         sys.exit(1)
 

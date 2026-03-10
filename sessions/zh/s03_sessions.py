@@ -23,8 +23,8 @@
     python zh/s03_sessions.py
 
 需要在 .env 中配置:
-    ANTHROPIC_API_KEY=sk-ant-xxxxx
-    MODEL_ID=claude-sonnet-4-20250514
+    DASHSCOPE_API_KEY=sk-xxxxx
+    MODEL_ID=qwen-plus
 """
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -48,10 +48,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 SYSTEM_PROMPT = (
@@ -383,7 +383,7 @@ class ContextGuard:
         return head + f"\n\n[... truncated ({len(result)} chars total, showing first {len(head)}) ...]"
 
     def compact_history(self, messages: list[dict],
-                        api_client: Anthropic, model: str) -> list[dict]:
+                        api_client: OpenAI, model: str) -> list[dict]:
         """
         将前 50% 的消息压缩为 LLM 生成的摘要。
         保留最后 N 条消息 (N = max(4, 总数的 20%)) 不变。
@@ -412,16 +412,13 @@ class ContextGuard:
         )
 
         try:
-            summary_resp = api_client.messages.create(
+            summary_messages = [{"role": "system", "content": "You are a conversation summarizer. Be concise and factual."}, {"role": "user", "content": summary_prompt}]
+            summary_resp = api_client.chat.completions.create(
                 model=model,
                 max_tokens=2048,
-                system="You are a conversation summarizer. Be concise and factual.",
-                messages=[{"role": "user", "content": summary_prompt}],
+                messages=summary_messages,
             )
-            summary_text = ""
-            for block in summary_resp.content:
-                if hasattr(block, "text"):
-                    summary_text += block.text
+            summary_text = summary_resp.choices[0].message.content or ""
 
             print_session(
                 f"  [compact] {len(old_messages)} messages -> summary "
@@ -467,7 +464,7 @@ class ContextGuard:
 
     def guard_api_call(
         self,
-        api_client: Anthropic,
+        api_client: OpenAI,
         model: str,
         system: str,
         messages: list[dict],
@@ -476,23 +473,25 @@ class ContextGuard:
     ) -> Any:
         """
         三阶段重试:
-          第0次尝试: 正常调用
-          第1次尝试: 截断过大的工具结果
-          第2次尝试: 通过 LLM 摘要压缩历史
+          第 0 次尝试：正常调用
+          第 1 次尝试：截断过大的工具结果
+          第 2 次尝试：通过 LLM 摘要压缩历史
         """
         current_messages = messages
+        # 为 OpenAI API 构建消息，添加 system 到消息列表开头
+        base_messages = [{"role": "system", "content": system}]
 
         for attempt in range(max_retries + 1):
             try:
+                api_messages = base_messages + current_messages
                 kwargs: dict[str, Any] = {
                     "model": model,
                     "max_tokens": 8096,
-                    "system": system,
-                    "messages": current_messages,
+                    "messages": api_messages,
                 }
                 if tools:
                     kwargs["tools"] = tools
-                result = api_client.messages.create(**kwargs)
+                result = api_client.chat.completions.create(**kwargs)
                 if current_messages is not messages:
                     messages.clear()
                     messages.extend(current_messages)
@@ -580,40 +579,49 @@ def tool_get_current_time() -> str:
 
 TOOLS = [
     {
-        "name": "read_file",
-        "description": "Read the contents of a file under the workspace directory.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path relative to workspace directory.",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file under the workspace directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path relative to workspace directory.",
+                    },
                 },
+                "required": ["file_path"],
             },
-            "required": ["file_path"],
         },
     },
     {
-        "name": "list_directory",
-        "description": "List files and subdirectories in a directory under workspace.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "directory": {
-                    "type": "string",
-                    "description": "Path relative to workspace directory. Default is root.",
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and subdirectories in a directory under workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Path relative to workspace directory. Default is root.",
+                    },
                 },
+                "required": [],
             },
-            "required": [],
         },
     },
     {
-        "name": "get_current_time",
-        "description": "Get the current date and time in UTC.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current date and time in UTC.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
         },
     },
 ]
@@ -816,61 +824,72 @@ def agent_loop() -> None:
                     messages.pop()
                 break
 
-            messages.append({
-                "role": "assistant",
-                "content": response.content,
-            })
+            # 获取 assistant 消息
+            assistant_message = response.choices[0].message
+            assistant_text = assistant_message.content or ""
+            tool_calls = assistant_message.tool_calls or []
 
-            # 将内容块序列化为 JSONL 存储格式
-            serialized_content = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    serialized_content.append({"type": "text", "text": block.text})
-                elif block.type == "tool_use":
-                    serialized_content.append({
-                        "type": "tool_use",
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input,
-                    })
-            store.save_turn("assistant", serialized_content)
+            # 追加 assistant 回复到历史
+            if assistant_text:
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_text,
+                })
+                # 将内容序列化为 JSONL 存储格式
+                serialized_content = [{"type": "text", "text": assistant_text}]
+                store.save_turn("assistant", serialized_content)
 
-            if response.stop_reason == "end_turn":
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+            # 检查 finish_reason
+            finish_reason = response.choices[0].finish_reason
+
+            if finish_reason == "stop":
                 if assistant_text:
                     print_assistant(assistant_text)
                 break
 
-            elif response.stop_reason == "tool_use":
+            elif finish_reason == "tool_calls" and tool_calls:
+                import json
+                print_info(f"[tool_calls: {len(tool_calls)}]")
+                
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    result = process_tool_call(block.name, block.input)
+                for tool_call in tool_calls:
+                    function_name = tool_call.function.name
+                    try:
+                        function_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        function_args = {}
+                    
+                    result = process_tool_call(function_name, function_args)
+                    print_tool(function_name, str(function_args))
                     store.save_tool_result(
-                        block.id, block.name, block.input, result
+                        tool_call.id, function_name, function_args, result
                     )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
+                    
+                    # 添加工具调用到消息历史
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": function_name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }],
+                    })
+                    
+                    # 添加工具结果
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
                         "content": result,
                     })
-
-                messages.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
+                
                 continue
 
             else:
-                print_info(f"[stop_reason={response.stop_reason}]")
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+                print_info(f"[finish_reason={finish_reason}]")
                 if assistant_text:
                     print_assistant(assistant_text)
                 break
@@ -881,8 +900,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
 

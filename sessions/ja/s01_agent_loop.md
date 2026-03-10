@@ -103,8 +103,8 @@ def agent_loop() -> None:
 
 ```sh
 # .env に API キーを設定
-echo 'ANTHROPIC_API_KEY=sk-ant-xxxxx' > .env
-echo 'MODEL_ID=claude-sonnet-4-20250514' >> .env
+echo 'DASHSCOPE_API_KEY=sk-ant-xxxxx' > .env
+echo 'MODEL_ID=qwen-plus' >> .env
 
 # エージェントを起動
 python ja/s01_agent_loop.py

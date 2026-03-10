@@ -52,14 +52,14 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
 MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
@@ -894,7 +894,7 @@ def agent_loop() -> None:
         # Agent 内循环: 处理连续的工具调用直到 end_turn
         while True:
             try:
-                response = client.messages.create(
+                response = client.chat.completions.create(
                     model=MODEL_ID, max_tokens=8096,
                     system=system_prompt, tools=TOOLS, messages=messages,
                 )
@@ -906,25 +906,25 @@ def agent_loop() -> None:
                     messages.pop()
                 break
 
-            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "assistant", "content": response.choices[0].message.content})
 
-            if response.stop_reason == "end_turn":
-                text = "".join(b.text for b in response.content if hasattr(b, "text"))
+            if response.choices[0].finish_reason == "stop":
+                text = "".join(b.text for b in response.choices[0].message.content if hasattr(b, "text"))
                 if text:
                     print_assistant(text)
                 break
-            elif response.stop_reason == "tool_use":
+            elif response.choices[0].finish_reason == "tool_calls":
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
+                for block in response.choices[0].message.content:
+                    if block.type != "tool_calls":
                         continue
                     result = process_tool_call(block.name, block.input)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
                 messages.append({"role": "user", "content": tool_results})
                 continue
             else:
-                print_info(f"[stop_reason={response.stop_reason}]")
-                text = "".join(b.text for b in response.content if hasattr(b, "text"))
+                print_info(f"[stop_reason={response.choices[0].finish_reason}]")
+                text = "".join(b.text for b in response.choices[0].message.content if hasattr(b, "text"))
                 if text:
                     print_assistant(text)
                 break
@@ -935,12 +935,12 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}错误: 未设置 ANTHROPIC_API_KEY.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}错误：未设置 DASHSCOPE_API_KEY.{RESET}")
         print(f"{DIM}将 .env.example 复制为 .env 并填入你的密钥.{RESET}")
         sys.exit(1)
     if not WORKSPACE_DIR.is_dir():
-        print(f"{YELLOW}错误: 未找到工作区目录: {WORKSPACE_DIR}{RESET}")
+        print(f"{YELLOW}错误：未找到工作区目录：{WORKSPACE_DIR}{RESET}")
         print(f"{DIM}请从 claw0 项目根目录运行.{RESET}")
         sys.exit(1)
     agent_loop()

@@ -80,7 +80,8 @@ pip install -r requirements.txt
 
 # 3. 設定
 cp .env.example .env
-# .env を編集: ANTHROPIC_API_KEY と MODEL_ID を設定
+# .env を編集: DASHSCOPE_API_KEY と MODEL_ID を設定
+# 阿里云百炼から API Key を取得: https://bailian.console.aliyun.com/
 
 # 4. 任意のセクションを実行 (言語を選択)
 python sessions/ja/s01_agent_loop.py    # 日本語
@@ -150,12 +151,12 @@ claw0/
 ## 前提条件
 
 - Python 3.11+
-- Anthropic (または互換プロバイダー) の API キー
+- 阿里云百炼 (Qwen モデル用) の API キー
 
 ## 依存関係
 
 ```
-anthropic>=0.39.0
+openai>=1.0.0
 python-dotenv>=1.0.0
 websockets>=12.0
 croniter>=2.0.0

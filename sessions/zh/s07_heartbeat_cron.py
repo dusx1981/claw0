@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from anthropic import Anthropic
+from openai import OpenAI
 from croniter import croniter
 from dotenv import load_dotenv
 
@@ -40,10 +40,10 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 CRON_DIR = WORKSPACE_DIR / "cron"
@@ -133,11 +133,11 @@ def run_agent_single_turn(prompt: str, system_prompt: str | None = None) -> str:
     """单轮 LLM 调用, 不使用工具, 返回纯文本."""
     sys_prompt = system_prompt or "You are a helpful assistant performing a background check."
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL_ID, max_tokens=2048, system=sys_prompt,
             messages=[{"role": "user", "content": prompt}],
         )
-        return "".join(b.text for b in response.content if hasattr(b, "text")).strip()
+        return "".join(b.text for b in response.choices[0].message.content if hasattr(b, "text")).strip()
     except Exception as exc:
         return f"[agent error: {exc}]"
 
@@ -604,7 +604,7 @@ def agent_loop() -> None:
             messages.append({"role": "user", "content": user_input})
             while True:
                 try:
-                    response = client.messages.create(
+                    response = client.chat.completions.create(
                         model=MODEL_ID, max_tokens=8096, system=system_prompt,
                         tools=MEMORY_TOOLS, messages=messages,
                     )
@@ -616,25 +616,25 @@ def agent_loop() -> None:
                         messages.pop()
                     break
 
-                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "assistant", "content": response.choices[0].message.content})
 
-                if response.stop_reason == "end_turn":
-                    text = "".join(b.text for b in response.content if hasattr(b, "text"))
+                if response.choices[0].finish_reason == "stop":
+                    text = "".join(b.text for b in response.choices[0].message.content if hasattr(b, "text"))
                     if text:
                         print_assistant(text)
                     break
-                elif response.stop_reason == "tool_use":
+                elif response.choices[0].finish_reason == "tool_calls":
                     results = []
-                    for block in response.content:
-                        if block.type != "tool_use":
+                    for block in response.choices[0].message.content:
+                        if block.type != "tool_calls":
                             continue
                         print_info(f"  [tool: {block.name}]")
                         results.append({"type": "tool_result", "tool_use_id": block.id,
                                         "content": handle_tool(block.name, block.input)})
                     messages.append({"role": "user", "content": results})
                 else:
-                    print_info(f"[stop_reason={response.stop_reason}]")
-                    text = "".join(b.text for b in response.content if hasattr(b, "text"))
+                    print_info(f"[stop_reason={response.choices[0].finish_reason}]")
+                    text = "".join(b.text for b in response.choices[0].message.content if hasattr(b, "text"))
                     if text:
                         print_assistant(text)
                     break
@@ -649,7 +649,7 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("DASHSCOPE_API_KEY"):
         print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)

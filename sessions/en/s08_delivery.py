@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -56,10 +56,10 @@ from anthropic import Anthropic
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
@@ -787,12 +787,10 @@ def agent_loop() -> None:
         # Agent inner loop (tool calls)
         while True:
             try:
-                response = client.messages.create(
-                    model=MODEL_ID,
-                    max_tokens=4096,
-                    system=system_prompt,
-                    tools=TOOLS,
-                    messages=messages,
+                api_messages = [{"role": "system", "content": system_prompt}] + messages
+                response = client.chat.completions.create(
+                    model=MODEL_ID, max_tokens=4096,
+                    tools=TOOLS, messages=api_messages,
                 )
             except Exception as exc:
                 print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
@@ -804,14 +802,11 @@ def agent_loop() -> None:
 
             messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": response.choices[0].message.content,
             })
 
-            if response.stop_reason == "end_turn":
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+            if response.choices[0].finish_reason == "stop":
+                assistant_text = response.choices[0].message.content or ""
                 if assistant_text:
                     print_assistant(assistant_text)
                     chunks = chunk_message(assistant_text, default_channel)
@@ -819,27 +814,28 @@ def agent_loop() -> None:
                         queue.enqueue(default_channel, default_to, chunk)
                 break
 
-            elif response.stop_reason == "tool_use":
+            elif response.choices[0].finish_reason == "tool_calls":
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    result = process_tool_call(block.name, block.input, memory)
-                    print_info(f"  {DIM}[tool: {block.name}]{RESET}")
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-                messages.append({"role": "user", "content": tool_results})
+                tool_calls = response.choices[0].message.tool_calls
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        result = process_tool_call(
+                            tool_call.function.name,
+                            json.loads(tool_call.function.arguments),
+                            memory
+                        )
+                        print_info(f"  {DIM}[tool: {tool_call.function.name}]{RESET}")
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
+                        })
+                    messages.extend(tool_results)
                 continue
 
             else:
-                print_info(f"[stop_reason={response.stop_reason}]")
-                assistant_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        assistant_text += block.text
+                print_info(f"[finish_reason={response.choices[0].finish_reason}]")
+                assistant_text = response.choices[0].message.content or ""
                 if assistant_text:
                     print_assistant(assistant_text)
                     chunks = chunk_message(assistant_text, default_channel)
@@ -857,8 +853,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
 

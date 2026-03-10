@@ -80,7 +80,8 @@ pip install -r requirements.txt
 
 # 3. 配置
 cp .env.example .env
-# 编辑 .env: 填入 ANTHROPIC_API_KEY 和 MODEL_ID
+# 编辑 .env: 填入 DASHSCOPE_API_KEY 和 MODEL_ID
+# 从阿里云百炼获取 API Key: https://bailian.console.aliyun.com/
 
 # 4. 运行任意章节 (选择你的语言)
 python sessions/zh/s01_agent_loop.py    # 中文
@@ -149,12 +150,12 @@ claw0/
 ## 前置要求
 
 - Python 3.11+
-- Anthropic (或兼容服务商) 的 API key
+- 阿里云百炼的 API key (用于调用通义千问模型)
 
 ## 依赖
 
 ```
-anthropic>=0.39.0
+openai>=1.0.0
 python-dotenv>=1.0.0
 websockets>=12.0
 croniter>=2.0.0

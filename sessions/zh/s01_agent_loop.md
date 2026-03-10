@@ -105,8 +105,8 @@ def agent_loop() -> None:
 
 ```sh
 # 确保 .env 中有你的密钥
-echo 'ANTHROPIC_API_KEY=sk-ant-xxxxx' > .env
-echo 'MODEL_ID=claude-sonnet-4-20250514' >> .env
+echo 'DASHSCOPE_API_KEY=sk-ant-xxxxx' > .env
+echo 'MODEL_ID=qwen-plus' >> .env
 
 # 运行 agent
 python zh/s01_agent_loop.py

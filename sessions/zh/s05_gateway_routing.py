@@ -39,14 +39,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
 MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 AGENTS_DIR = WORKSPACE_DIR / ".agents"
@@ -218,11 +218,13 @@ class AgentManager:
 # ---------------------------------------------------------------------------
 
 TOOLS = [
-    {"name": "read_file", "description": "Read the contents of a file.",
-     "input_schema": {"type": "object", "required": ["file_path"],
-                      "properties": {"file_path": {"type": "string", "description": "Path to the file."}}}},
-    {"name": "get_current_time", "description": "Get the current date and time in UTC.",
-     "input_schema": {"type": "object", "properties": {}}},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read the contents of a file.",
+        "parameters": {"type": "object", "required": ["file_path"],
+                       "properties": {"file_path": {"type": "string", "description": "Path to the file."}}}}},
+    {"type": "function", "function": {
+        "name": "get_current_time", "description": "Get the current date and time in UTC.",
+        "parameters": {"type": "object", "properties": {}}}},
 ]
 
 def _tool_read(file_path: str) -> str:
@@ -324,10 +326,11 @@ async def run_agent(mgr: AgentManager, agent_id: str, session_key: str,
 async def _agent_loop(model: str, system: str, messages: list[dict]) -> str:
     for _ in range(15):
         try:
+            api_messages = [{"role": "system", "content": system}] + messages
             response = await asyncio.to_thread(
-                client.messages.create,
+                client.chat.completions.create,
                 model=model, max_tokens=4096,
-                system=system, tools=TOOLS, messages=messages,
+                tools=TOOLS, messages=api_messages,
             )
         except Exception as exc:
             while messages and messages[-1]["role"] != "user":
@@ -335,20 +338,58 @@ async def _agent_loop(model: str, system: str, messages: list[dict]) -> str:
             if messages:
                 messages.pop()
             return f"API Error: {exc}"
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason == "end_turn":
-            return "".join(b.text for b in response.content if hasattr(b, "text")) or "[no text]"
-        if response.stop_reason == "tool_use":
+        
+        assistant_message = response.choices[0].message
+        assistant_text = assistant_message.content or ""
+        tool_calls = assistant_message.tool_calls or []
+        
+        if assistant_text:
+            messages.append({"role": "assistant", "content": assistant_text})
+        
+        finish_reason = response.choices[0].finish_reason
+        
+        if finish_reason == "stop":
+            return assistant_text or "[no text]"
+        
+        if finish_reason == "tool_calls" and tool_calls:
+            import json
             results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                print(f"  {DIM}[tool: {block.name}]{RESET}")
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": process_tool_call(block.name, block.input)})
-            messages.append({"role": "user", "content": results})
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    function_args = {}
+                
+                print(f"  {DIM}[tool: {function_name}]{RESET}")
+                result = process_tool_call(function_name, function_args)
+                
+                # 添加工具调用消息
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": tool_call.function.arguments,
+                        },
+                    }],
+                })
+                
+                # 添加工具结果
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+            
+            # 将所有工具结果合并为一条消息
+            messages.extend(results)
             continue
-        return "".join(b.text for b in response.content if hasattr(b, "text")) or f"[stop={response.stop_reason}]"
+        
+        return assistant_text or f"[finish_reason={finish_reason}]"
     return "[max iterations reached]"
 
 # ---------------------------------------------------------------------------
@@ -615,8 +656,8 @@ def repl() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
     repl()

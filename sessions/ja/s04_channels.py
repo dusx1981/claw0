@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 try:
     import httpx
@@ -37,10 +37,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -628,10 +628,11 @@ def run_agent_turn(
 
     while True:
         try:
-            response = client.messages.create(
-                model=MODEL_ID, max_tokens=8096,
-                system=SYSTEM_PROMPT, tools=TOOLS, messages=messages,
-            )
+            api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+                            response = client.chat.completions.create(
+                                model=MODEL_ID, max_tokens=8096,
+                                tools=TOOLS, messages=api_messages,
+                            )
         except Exception as exc:
             print(f"\n{YELLOW}API Error: {exc}{RESET}\n")
             while messages and messages[-1]["role"] != "user":

@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -336,7 +336,7 @@ class ContextGuard:
     def compact_history(
         self,
         messages: list[dict],
-        api_client: Anthropic,
+        api_client: OpenAI,
         model: str,
     ) -> list[dict]:
         """Compress the first 50% of messages into an LLM-generated summary.
@@ -391,16 +391,13 @@ class ContextGuard:
         )
 
         try:
-            summary_resp = api_client.messages.create(
+            api_messages = [{"role": "system", "content": "You are a conversation summarizer. Be concise and factual."}, {"role": "user", "content": summary_prompt}]
+            summary_resp = api_client.chat.completions.create(
                 model=model,
                 max_tokens=2048,
-                system="You are a conversation summarizer. Be concise and factual.",
-                messages=[{"role": "user", "content": summary_prompt}],
+                messages=api_messages,
             )
-            summary_text = ""
-            for block in summary_resp.content:
-                if hasattr(block, "text"):
-                    summary_text += block.text
+            summary_text = summary_resp.choices[0].message.content or ""
 
             print_resilience(
                 f"Compacted {len(old_messages)} messages -> summary "
@@ -686,9 +683,9 @@ class ResilienceRunner:
                     f"Rotating to profile '{profile.name}'"
                 )
 
-            api_client = Anthropic(
+            api_client = OpenAI(
                 api_key=profile.api_key,
-                base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+                base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
             )
 
             # ---- LAYER 2: Overflow Recovery ----
@@ -789,9 +786,9 @@ class ResilienceRunner:
                     f"Fallback: model='{fallback_model}', profile='{profile.name}'"
                 )
 
-                api_client = Anthropic(
+                api_client = OpenAI(
                     api_key=profile.api_key,
-                    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+                    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 )
 
                 try:
@@ -824,7 +821,7 @@ class ResilienceRunner:
 
     def _run_attempt(
         self,
-        api_client: Anthropic,
+        api_client: OpenAI,
         model: str,
         system: str,
         messages: list[dict],
@@ -832,8 +829,8 @@ class ResilienceRunner:
     ) -> tuple[Any, list[dict]]:
         """Layer 3: the standard tool-use loop.
 
-        Runs the while True + stop_reason pattern from s01/s02.
-        Returns (final_response, updated_messages) on end_turn.
+        Runs the while True + finish_reason pattern.
+        Returns (final_response, updated_messages) on stop.
         Re-raises any API exception for the outer layers to handle.
         """
         current_messages = list(messages)
@@ -842,41 +839,41 @@ class ResilienceRunner:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = api_client.messages.create(
+            api_messages = [{"role": "system", "content": system}] + current_messages
+            response = api_client.chat.completions.create(
                 model=model,
                 max_tokens=8096,
-                system=system,
                 tools=tools,
-                messages=current_messages,
+                messages=api_messages,
             )
 
             current_messages.append({
                 "role": "assistant",
-                "content": response.content,
+                "content": response.choices[0].message.content,
             })
 
-            if response.stop_reason == "end_turn":
+            if response.choices[0].finish_reason == "stop":
                 return response, current_messages
 
-            elif response.stop_reason == "tool_use":
+            elif response.choices[0].finish_reason == "tool_calls":
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    result = process_tool_call(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-                current_messages.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
+                tool_calls = response.choices[0].message.tool_calls
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        result = process_tool_call(
+                            tool_call.function.name,
+                            json.loads(tool_call.function.arguments)
+                        )
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
+                        })
+                    current_messages.extend(tool_results)
                 continue
 
             else:
-                # Unexpected stop_reason (e.g. max_tokens) -- treat as end_turn
+                # Unexpected finish_reason -- treat as stop
                 return response, current_messages
 
         raise RuntimeError(
@@ -1121,8 +1118,8 @@ def agent_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
 

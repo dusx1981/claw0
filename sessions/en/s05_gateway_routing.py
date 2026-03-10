@@ -40,14 +40,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from openai import OpenAI
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=True)
 
-MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL") or None,
+MODEL_ID = os.getenv("MODEL_ID", "qwen-plus")
+client = OpenAI(
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent.parent / "workspace"
 AGENTS_DIR = WORKSPACE_DIR / ".agents"
@@ -325,10 +325,11 @@ async def run_agent(mgr: AgentManager, agent_id: str, session_key: str,
 async def _agent_loop(model: str, system: str, messages: list[dict]) -> str:
     for _ in range(15):
         try:
+            api_messages = [{"role": "system", "content": system}] + messages
             response = await asyncio.to_thread(
-                client.messages.create,
+                client.chat.completions.create,
                 model=model, max_tokens=4096,
-                system=system, tools=TOOLS, messages=messages,
+                tools=TOOLS, messages=api_messages,
             )
         except Exception as exc:
             while messages and messages[-1]["role"] != "user":
@@ -336,20 +337,23 @@ async def _agent_loop(model: str, system: str, messages: list[dict]) -> str:
             if messages:
                 messages.pop()
             return f"API Error: {exc}"
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason == "end_turn":
-            return "".join(b.text for b in response.content if hasattr(b, "text")) or "[no text]"
-        if response.stop_reason == "tool_use":
+        messages.append({"role": "assistant", "content": response.choices[0].message.content})
+        if response.choices[0].finish_reason == "stop":
+            return response.choices[0].message.content or "[no text]"
+        if response.choices[0].finish_reason == "tool_calls":
             results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                print(f"  {DIM}[tool: {block.name}]{RESET}")
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": process_tool_call(block.name, block.input)})
-            messages.append({"role": "user", "content": results})
+            tool_calls = response.choices[0].message.tool_calls
+            if tool_calls:
+                for tool_call in tool_calls:
+                    print(f"  {DIM}[tool: {tool_call.function.name}]{RESET}")
+                    results.append({"role": "tool", "tool_call_id": tool_call.id,
+                                    "content": process_tool_call(
+                                        tool_call.function.name,
+                                        json.loads(tool_call.function.arguments)
+                                    )})
+                messages.extend(results)
             continue
-        return "".join(b.text for b in response.content if hasattr(b, "text")) or f"[stop={response.stop_reason}]"
+        return response.choices[0].message.content or f"[finish_reason={response.choices[0].finish_reason}]"
     return "[max iterations reached]"
 
 # ---------------------------------------------------------------------------
@@ -616,8 +620,8 @@ def repl() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print(f"{YELLOW}Error: ANTHROPIC_API_KEY not set.{RESET}")
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        print(f"{YELLOW}Error: DASHSCOPE_API_KEY not set.{RESET}")
         print(f"{DIM}Copy .env.example to .env and fill in your key.{RESET}")
         sys.exit(1)
     repl()

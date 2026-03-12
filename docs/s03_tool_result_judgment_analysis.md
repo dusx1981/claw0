@@ -15,11 +15,43 @@
 
 当 assistant 调用多个工具时，会产生多个 `tool_result`，这些结果需要合并到同一个 `user` 消息中。
 
+### 1.3 关键前提：JSONL 写入顺序
+
+> ⚠️ **理解本文档的关键**：`_rebuild_history` 的输入（JSONL 记录）由 `agent_loop` 的输出逻辑决定。
+
+**`save_tool_result` 的写入逻辑**（lines 182-199）：
+
+```python
+def save_tool_result(self, tool_use_id: str, name: str,
+                     tool_input: dict, result: str) -> None:
+    ts = time.time()
+    # 先写入 tool_use 记录
+    self.append_transcript(self.current_session_id, {
+        "type": "tool_use",
+        ...
+    })
+    # 紧接着写入 tool_result 记录
+    self.append_transcript(self.current_session_id, {
+        "type": "tool_result",
+        ...
+    })
+```
+
+**`agent_loop` 的调用逻辑**（lines 854-866）：
+
+```python
+for tool_call in tool_calls:  # 按顺序逐个处理
+    result = process_tool_call(...)
+    store.save_tool_result(tool_call.id, ...)  # 每次写入 tool_use + tool_result 对
+```
+
+**结论**：JSONL 写入顺序是 `tool_use, tool_result` **交替出现**，而非所有 `tool_use` 先写、所有 `tool_result` 后写。
+
 ---
 
 ## 二、核心代码分析
 
-### 2.1 完整代码
+### 2.1 `tool_result` 处理代码
 
 ```python
 elif rtype == "tool_result":
@@ -42,7 +74,33 @@ elif rtype == "tool_result":
         })
 ```
 
-### 2.2 判断条件分解
+### 2.2 `tool_use` 处理代码
+
+```python
+elif rtype == "tool_use":
+    block = {
+        "type": "tool_use",
+        "id": record["tool_use_id"],
+        "name": record["name"],
+        "input": record["input"],
+    }
+    if messages and messages[-1]["role"] == "assistant":
+        content = messages[-1]["content"]
+        if isinstance(content, list):
+            content.append(block)
+        else:
+            messages[-1]["content"] = [
+                {"type": "text", "text": str(content)},
+                block,
+            ]
+    else:
+        messages.append({
+            "role": "assistant",
+            "content": [block],
+        })
+```
+
+### 2.3 `tool_result` 判断条件分解
 
 复合条件包含 **6 个子条件**，全部为 `True` 时执行合并操作：
 
@@ -55,9 +113,7 @@ elif rtype == "tool_result":
 | C5 | `isinstance(messages[-1]["content"][0], dict)` | content 第一个元素是字典 |
 | C6 | `messages[-1]["content"][0].get("type") == "tool_result"` | 第一个元素的 type 是 tool_result |
 
-### 2.3 条件链的短路求值
-
-Python 的 `and` 运算符采用短路求值，条件按顺序依次检查：
+### 2.4 条件链的短路求值
 
 ```
 C1 (messages 非空)
@@ -82,108 +138,298 @@ C6 (type 是 tool_result)
 
 ---
 
-## 三、场景矩阵与处理结果
+## 三、实际运行场景分析
 
-### 3.1 场景分类
+> 基于 `agent_loop` 的实际输出逻辑，分析 `_rebuild_history` 会遇到的真实场景。
 
-根据 6 个条件的组合，共有 **64 种理论组合**，但实际有效的场景如下：
+### 3.1 agent_loop 的三种 finish_reason
 
-| 场景 | C1 | C2 | C3 | C4 | C5 | C6 | 处理方式 | 典型情况 |
-|------|----|----|----|----|----|----|----------|----------|
-| 场景 A | ❌ | - | - | - | - | - | 创建新消息 | 消息列表为空 |
-| 场景 B | ✅ | ❌ | - | - | - | - | 创建新消息 | 最后消息是 assistant |
-| 场景 C | ✅ | ✅ | ❌ | - | - | - | 创建新消息 | user 消息的 content 是字符串 |
-| 场景 D | ✅ | ✅ | ✅ | ❌ | - | - | 创建新消息 | user 消息的 content 是空列表 |
-| 场景 E | ✅ | ✅ | ✅ | ✅ | ❌ | - | 创建新消息 | content 首元素不是字典 |
-| 场景 F | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | 创建新消息 | 首元素不是 tool_result |
-| 场景 G | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 合并消息 | 连续的 tool_result |
+```python
+finish_reason = response.choices[0].finish_reason
 
-### 3.2 场景详解
+if finish_reason == "stop":
+    # 场景 1：正常结束（纯文本回复）
+    ...
+elif finish_reason == "tool_calls" and tool_calls:
+    # 场景 2：工具调用
+    ...
+else:
+    # 场景 3：其他情况
+    ...
+```
 
 ---
 
-#### 场景 A：消息列表为空
+### 3.2 场景一：finish_reason == "stop"（纯文本回复）
 
-**条件状态**：`C1 = False`（`messages` 为空列表）
+**触发条件**：Assistant 完成回复，无需调用工具。
+
+**数据流**：
+
+```
+API Response                          JSONL 记录                     
+─────────────                         ───────────                    
+{                                     {"type": "assistant",          
+  "finish_reason": "stop",              "content": [{"type": "text",    
+  "message": {                           "text": "您好！"}],            
+    "content": "您好！",                 "ts": 1705312200               
+    "role": "assistant"                }                                  
+  }                                                                        
+```
+
+**重建结果**：
+```python
+messages = [
+    {"role": "user", "content": "你好"},
+    {"role": "assistant", "content": [{"type": "text", "text": "您好！"}]}
+]
+```
+
+**说明**：此场景不涉及 `tool_result`，重建逻辑简单直接。
+
+---
+
+### 3.3 场景二：finish_reason == "tool_calls"（工具调用）
+
+#### 3.3.1 单工具调用
+
+**JSONL 写入顺序**（由 `save_tool_result` 产生）：
+
+```json
+{"type": "tool_use", "tool_use_id": "call_001", "name": "read_file", ...}
+{"type": "tool_result", "tool_use_id": "call_001", "content": "文件内容", ...}
+```
+
+**重建过程追踪**：
+
+```
+初始状态: messages = [之前的对话...]
+
+步骤 1: 处理 tool_use call_001
+  ├─ rtype == "tool_use"
+  ├─ messages[-1]["role"] 可能是 user 或 assistant
+  │   └─ 若是 assistant → 合并到现有消息
+  │   └─ 若是 user → 创建新 assistant 消息
+  └─ 结果: messages 包含 assistant 消息（含 tool_use_001）
+
+步骤 2: 处理 tool_result call_001
+  ├─ rtype == "tool_result"
+  ├─ C2 检查: messages[-1]["role"] == "assistant" ✗
+  │   └─ C2 = False → 创建新 user 消息
+  └─ 结果: messages 包含 user 消息（含 tool_result_001）
+```
+
+**最终 messages 结构**：
+```python
+messages = [
+    ...,  # 之前的对话
+    {"role": "assistant", "content": [
+        {"type": "text", "text": "我来读取文件"},
+        {"type": "tool_use", "id": "call_001", "name": "read_file", ...}
+    ]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_001", "content": "文件内容"}
+    ]}
+]
+```
+
+---
+
+#### 3.3.2 多工具并行调用
+
+> ⚠️ **关键场景**：展示 `tool_use` 和 `tool_result` 交替写入的实际行为。
+
+**API Response**：
+```json
+{
+  "finish_reason": "tool_calls",
+  "message": {
+    "tool_calls": [
+      {"id": "call_001", "function": {"name": "read_file", ...}},
+      {"id": "call_002", "function": {"name": "read_file", ...}},
+      {"id": "call_003", "function": {"name": "get_current_time", ...}}
+    ]
+  }
+}
+```
+
+**JSONL 写入顺序**（由 `agent_loop` 循环 + `save_tool_result` 产生）：
+
+```json
+{"type": "tool_use", "tool_use_id": "call_001", ...}
+{"type": "tool_result", "tool_use_id": "call_001", ...}
+{"type": "tool_use", "tool_use_id": "call_002", ...}
+{"type": "tool_result", "tool_use_id": "call_002", ...}
+{"type": "tool_use", "tool_use_id": "call_003", ...}
+{"type": "tool_result", "tool_use_id": "call_003", ...}
+```
+
+**重建过程逐步追踪**：
+
+假设初始状态：`messages = [assistant 文本消息]`
+
+```
+步骤 1: 处理 tool_use call_001
+  ├─ messages[-1]["role"] == "assistant" ✓
+  ├─ 合并到现有 assistant 消息
+  └─ messages: [assistant(text, tool_use_001)]
+
+步骤 2: 处理 tool_result call_001
+  ├─ messages[-1]["role"] == "assistant" ✗
+  ├─ C2 = False → 创建新 user 消息
+  └─ messages: [assistant(...), user(tool_result_001)]
+
+步骤 3: 处理 tool_use call_002
+  ├─ messages[-1]["role"] == "user" ✗
+  ├─ 不满足合并条件（最后消息不是 assistant）
+  ├─ 创建新 assistant 消息
+  └─ messages: [..., user(...), assistant(tool_use_002)]
+
+步骤 4: 处理 tool_result call_002
+  ├─ messages[-1]["role"] == "assistant" ✗
+  ├─ C2 = False → 创建新 user 消息
+  └─ messages: [..., assistant(...), user(tool_result_002)]
+
+步骤 5-6: 处理 call_003（同理）
+  └─ 创建新 assistant 消息，再创建新 user 消息
+```
+
+**实际重建结果**：
+
+```python
+messages = [
+    {"role": "assistant", "content": [
+        {"type": "text", "text": "我来读取这些文件"},
+        {"type": "tool_use", "id": "call_001", ...}
+    ]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_001", ...}
+    ]},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_002", ...}
+    ]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_002", ...}
+    ]},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "call_003", ...}
+    ]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_003", ...}
+    ]}
+]
+```
+
+**核心结论**：
+
+由于 JSONL 写入顺序是 `tool_use, tool_result` 交替，重建后的消息列表中 `assistant` 和 `user` **也是交替出现**的，每个 `tool_use` 后紧跟一个 `tool_result`。
+
+---
+
+### 3.4 与 OpenAI API 的兼容性
+
+上述交替格式**符合 OpenAI API 的消息模式**：
+
+| 消息位置 | OpenAI 格式 | 对应 JSONL 记录 |
+|---------|------------|----------------|
+| 第 N 条 | `{"role": "assistant", "tool_calls": [...]}` | `tool_use` 记录 |
+| 第 N+1 条 | `{"role": "tool", "tool_call_id": "...", "content": "..."}` | `tool_result` 记录 |
+
+**agent_loop 中实际使用的 OpenAI 格式**（lines 869-887）：
+
+```python
+# 添加 assistant 消息（含 tool_calls）
+messages.append({
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [{
+        "id": tool_call.id,
+        "type": "function",
+        "function": {
+            "name": function_name,
+            "arguments": tool_call.function.arguments,
+        },
+    }],
+})
+
+# 添加 tool 消息（含结果）
+messages.append({
+    "role": "tool",
+    "tool_call_id": tool_call.id,
+    "content": result,
+})
+```
+
+**设计意义**：虽然 JSONL 存储格式参考 Anthropic 风格，但 `_rebuild_history` 重建后的消息结构实际上更接近 OpenAI 的 `tool_calls` 模式，保证了与运行时 API 调用的一致性。
+
+---
+
+## 四、边界情况分析
+
+> 以下场景在实际运行中较少出现，但 `_rebuild_history` 通过防御性编程处理这些情况。
+
+### 4.1 场景矩阵
+
+| 场景 | C1 | C2 | C3 | C4 | C5 | C6 | 处理方式 | 触发条件 |
+|------|----|----|----|----|----|----|----------|----------|
+| A | ❌ | - | - | - | - | - | 创建新消息 | 消息列表为空 |
+| B | ✅ | ❌ | - | - | - | - | 创建新消息 | 最后消息是 assistant |
+| C | ✅ | ✅ | ❌ | - | - | - | 创建新消息 | user 消息的 content 是字符串 |
+| D | ✅ | ✅ | ✅ | ❌ | - | - | 创建新消息 | content 是空列表 |
+| E | ✅ | ✅ | ✅ | ✅ | ❌ | - | 创建新消息 | content 首元素不是字典 |
+| F | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | 创建新消息 | 首元素不是 tool_result |
+
+---
+
+### 4.2 场景 A：消息列表为空
+
+**条件状态**：`C1 = False`
 
 **JSONL 输入**：
 ```json
 {"type": "tool_result", "tool_use_id": "call_001", "content": "结果1", "ts": 1705312200.0}
 ```
 
-**当前 messages 状态**：
-```python
-messages = []
-```
-
 **处理结果**：
 ```python
 messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "call_001",
-                "content": "结果1"
-            }
-        ]
-    }
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_001", "content": "结果1"}
+    ]}
 ]
 ```
 
-**说明**：JSONL 文件以 tool_result 开头（异常但可能），直接创建新的 user 消息。
+**说明**：JSONL 文件以 `tool_result` 开头（异常情况），直接创建新的 user 消息。
 
 ---
 
-#### 场景 B：最后消息是 assistant
+### 4.3 场景 B：最后消息是 assistant（实际运行中常见）
 
 **条件状态**：`C1 = True, C2 = False`
 
+**这是实际运行中最常见的场景**：处理 `tool_result` 时，上一条记录是 `tool_use`（已合并到 assistant 消息）。
+
 **JSONL 输入**：
 ```json
-{"type": "assistant", "content": [{"type": "text", "text": "我来帮您查询"}], "ts": 1705312200.0}
-{"type": "tool_result", "tool_use_id": "call_001", "content": "结果1", "ts": 1705312201.0}
+{"type": "tool_use", "tool_use_id": "call_001", ...}
+{"type": "tool_result", "tool_use_id": "call_001", ...}
 ```
 
 **处理过程**：
-1. 处理 assistant 记录后：
 ```python
+# 处理 tool_use 后
 messages = [
-    {
-        "role": "assistant",
-        "content": [{"type": "text", "text": "我来帮您查询"}]
-    }
+    {"role": "assistant", "content": [{"type": "tool_use", ...}]}
 ]
+
+# 处理 tool_result 时
+# C2: messages[-1]["role"] == "assistant" ✗
+# → 创建新 user 消息
 ```
-
-2. 处理 tool_result：`C2` 检查 `messages[-1]["role"]` 为 `"assistant"`，条件为 False
-
-**最终 messages**：
-```python
-messages = [
-    {
-        "role": "assistant",
-        "content": [{"type": "text", "text": "我来帮您查询"}]
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "call_001",
-                "content": "结果1"
-            }
-        ]
-    }
-]
-```
-
-**说明**：标准的单工具调用流程，assistant 回复后跟随 tool_result。
 
 ---
 
-#### 场景 C：user 消息的 content 是字符串
+### 4.4 场景 C：user 消息的 content 是字符串
 
 **条件状态**：`C1 = True, C2 = True, C3 = False`
 
@@ -193,464 +439,113 @@ messages = [
 {"type": "tool_result", "tool_use_id": "call_001", "content": "结果1", "ts": 1705312201.0}
 ```
 
-**处理过程**：
-1. 处理 user 记录后：
+**处理结果**：
 ```python
 messages = [
-    {
-        "role": "user",
-        "content": "普通用户消息"  # 字符串类型
-    }
+    {"role": "user", "content": "普通用户消息"},  # 字符串
+    {"role": "user", "content": [               # 新创建
+        {"type": "tool_result", ...}
+    ]}
 ]
 ```
 
-2. 处理 tool_result：`C3` 检查 `isinstance(messages[-1]["content"], list)` 为 False
-
-**最终 messages**：
-```python
-messages = [
-    {
-        "role": "user",
-        "content": "普通用户消息"
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "call_001",
-                "content": "结果1"
-            }
-        ]
-    }
-]
-```
-
-**说明**：普通用户输入后出现 tool_result（可能是 JSONL 记录错误），创建新消息避免覆盖。
+**说明**：普通用户输入后出现 `tool_result`（可能是 JSONL 记录错误），创建新消息避免覆盖。
 
 ---
 
-#### 场景 D：content 是空列表
+### 4.5 场景 D-F：数据格式异常
 
-**条件状态**：`C1 = True, C2 = True, C3 = True, C4 = False`
+这些场景处理 JSONL 文件可能被手动编辑或损坏的情况：
 
-**JSONL 输入**：
-```json
-{"type": "user", "content": [], "ts": 1705312200.0}
-{"type": "tool_result", "tool_use_id": "call_001", "content": "结果1", "ts": 1705312201.0}
-```
-
-**处理过程**：
-1. 处理 user 记录后：
-```python
-messages = [
-    {
-        "role": "user",
-        "content": []  # 空列表
-    }
-]
-```
-
-2. 处理 tool_result：`C4` 检查 `messages[-1]["content"]` 为空列表，布尔值为 False
-
-**最终 messages**：
-```python
-messages = [
-    {
-        "role": "user",
-        "content": []
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "call_001",
-                "content": "结果1"
-            }
-        ]
-    }
-]
-```
-
-**说明**：虽然 content 是列表，但为空，无法检查首元素，创建新消息。
+| 场景 | 异常情况 | 处理方式 |
+|------|---------|---------|
+| D | content 是空列表 `[]` | 创建新消息 |
+| E | content 首元素不是字典 `["纯文本"]` | 创建新消息 |
+| F | 首元素 type 不是 tool_result `[{"type": "text", ...}]` | 创建新消息 |
 
 ---
 
-#### 场景 E：content 首元素不是字典
+## 五、设计决策分析
 
-**条件状态**：`C1 = True, C2 = True, C3 = True, C4 = True, C5 = False`
+### 5.1 为什么 tool_result 合并条件如此复杂？
 
-**JSONL 输入**：
-```json
-{"type": "user", "content": ["纯文本内容"], "ts": 1705312200.0}
-{"type": "tool_result", "tool_use_id": "call_001", "content": "结果1", "ts": 1705312201.0}
-```
+| 原因 | 说明 |
+|------|------|
+| **API 兼容性** | Anthropic API 要求消息严格交替，多个 `tool_result` 可能需要合并 |
+| **数据完整性** | JSONL 可能损坏或被手动编辑，需要防御性检查 |
+| **类型安全** | content 可能是字符串或列表，需要分别处理 |
+| **向后兼容** | 支持未来可能改变写入顺序的场景 |
 
-**处理过程**：
-1. 处理 user 记录后：
-```python
-messages = [
-    {
-        "role": "user",
-        "content": ["纯文本内容"]  # 列表中是字符串，不是字典
-    }
-]
-```
+### 5.2 当前实现 vs 理想实现
 
-2. 处理 tool_result：`C5` 检查 `isinstance(messages[-1]["content"][0], dict)` 为 False
+| 维度 | 当前实现 | 理想实现（Anthropic 风格） |
+|------|---------|------------------------|
+| JSONL 写入顺序 | `tool_use, tool_result` 交替 | 所有 `tool_use` 先写，所有 `tool_result` 后写 |
+| 重建后消息结构 | `assistant`/`user` 交替 | 单个 `assistant`（含所有 tool_use）+ 单个 `user`（含所有 tool_result） |
+| API 兼容性 | OpenAI `tool_calls` 模式 | Anthropic 消息格式 |
 
-**最终 messages**：
-```python
-messages = [
-    {
-        "role": "user",
-        "content": ["纯文本内容"]
-    },
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "call_001",
-                "content": "结果1"
-            }
-        ]
-    }
-]
-```
+### 5.3 潜在改进方向
 
-**说明**：非标准格式的 user 消息，创建新消息确保安全。
+如果需要实现"所有 tool_use 合并到一个 assistant，所有 tool_result 合并到一个 user"：
+
+| 方案 | 修改点 | 工作量 |
+|------|--------|--------|
+| A | 修改 `save_tool_result` 写入顺序 | 低 |
+| B | 修改 `_rebuild_history` 为两遍扫描 | 中 |
+| C | 在 `agent_loop` 中批量收集后再写入 | 低 |
 
 ---
 
-#### 场景 F：首元素不是 tool_result
+## 六、总结
 
-**条件状态**：`C1-5 = True, C6 = False`
+### 6.1 核心要点
 
-**JSONL 输入**：
-```json
-{"type": "assistant", "content": [{"type": "text", "text": "请继续"}], "ts": 1705312200.0}
-{"type": "user", "content": [{"type": "text", "text": "用户继续输入"}], "ts": 1705312201.0}
-{"type": "tool_result", "tool_use_id": "call_001", "content": "结果1", "ts": 1705312202.0}
-```
+1. **写入顺序决定重建结果**：`save_tool_result` 按 `tool_use, tool_result` 交替写入，导致重建后消息也是交替的。
 
-**处理过程**：
-1. 处理完前两条后：
-```python
-messages = [
-    {"role": "assistant", "content": [{"type": "text", "text": "请继续"}]},
-    {"role": "user", "content": [{"type": "text", "text": "用户继续输入"}]}  # type 是 text，不是 tool_result
-]
-```
+2. **C2 是关键条件**：实际运行中，处理 `tool_result` 时 `messages[-1]` 通常是 `assistant`（刚处理完 `tool_use`），所以 `C2 = False`，创建新 user 消息。
 
-2. 处理 tool_result：`C6` 检查 `messages[-1]["content"][0].get("type") == "tool_result"` 为 False
+3. **与 OpenAI API 兼容**：交替的消息结构符合 OpenAI 的 `tool_calls` 模式，保证了运行时 API 调用的一致性。
 
-**最终 messages**：
-```python
-messages = [
-    {"role": "assistant", "content": [{"type": "text", "text": "请继续"}]},
-    {"role": "user", "content": [{"type": "text", "text": "用户继续输入"}]},
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "tool_result",
-                "tool_use_id": "call_001",
-                "content": "结果1"
-            }
-        ]
-    }
-]
-```
+4. **防御性编程**：6 条件判断链确保即使 JSONL 格式异常，也能安全重建。
 
-**说明**：前一条 user 消息是普通文本，不能合并 tool_result。
-
----
-
-#### 场景 G：连续的 tool_result（核心场景）
-
-**条件状态**：`C1-6 全部为 True`
-
-**JSONL 输入**：
-```json
-{"type": "assistant", "content": [{"type": "text", "text": "我来查询"}], "ts": 1705312200.0}
-{"type": "tool_use", "tool_use_id": "call_001", "name": "read_file", "input": {"file_path": "a.txt"}, "ts": 1705312201.0}
-{"type": "tool_use", "tool_use_id": "call_002", "name": "read_file", "input": {"file_path": "b.txt"}, "ts": 1705312201.0}
-{"type": "tool_result", "tool_use_id": "call_001", "content": "文件A内容", "ts": 1705312202.0}
-{"type": "tool_result", "tool_use_id": "call_002", "content": "文件B内容", "ts": 1705312202.5}
-```
-
-**处理过程**：
-
-1. 处理 assistant 消息后：
-```python
-messages = [
-    {"role": "assistant", "content": [{"type": "text", "text": "我来查询"}]}
-]
-```
-
-2. 处理第一个 tool_use（合并到 assistant）：
-```python
-messages = [
-    {
-        "role": "assistant",
-        "content": [
-            {"type": "text", "text": "我来查询"},
-            {"type": "tool_use", "id": "call_001", "name": "read_file", "input": {"file_path": "a.txt"}}
-        ]
-    }
-]
-```
-
-3. 处理第二个 tool_use（继续合并）：
-```python
-messages = [
-    {
-        "role": "assistant",
-        "content": [
-            {"type": "text", "text": "我来查询"},
-            {"type": "tool_use", "id": "call_001", "name": "read_file", "input": {"file_path": "a.txt"}},
-            {"type": "tool_use", "id": "call_002", "name": "read_file", "input": {"file_path": "b.txt"}}
-        ]
-    }
-]
-```
-
-4. 处理第一个 tool_result（创建新 user 消息）：
-   - `C1 = True`（messages 非空）
-   - `C2 = False`（最后是 assistant）
-   
-```python
-messages = [
-    {
-        "role": "assistant",
-        "content": [
-            {"type": "text", "text": "我来查询"},
-            {"type": "tool_use", "id": "call_001", "name": "read_file", "input": {"file_path": "a.txt"}},
-            {"type": "tool_use", "id": "call_002", "name": "read_file", "input": {"file_path": "b.txt"}}
-        ]
-    },
-    {
-        "role": "user",
-        "content": [
-            {"type": "tool_result", "tool_use_id": "call_001", "content": "文件A内容"}
-        ]
-    }
-]
-```
-
-5. 处理第二个 tool_result（**合并**到现有 user 消息）：
-   - `C1 = True`（messages 非空）
-   - `C2 = True`（最后是 user）
-   - `C3 = True`（content 是列表）
-   - `C4 = True`（content 非空）
-   - `C5 = True`（首元素是字典）
-   - `C6 = True`（首元素 type 是 tool_result）
-
-```python
-messages = [
-    {
-        "role": "assistant",
-        "content": [
-            {"type": "text", "text": "我来查询"},
-            {"type": "tool_use", "id": "call_001", "name": "read_file", "input": {"file_path": "a.txt"}},
-            {"type": "tool_use", "id": "call_002", "name": "read_file", "input": {"file_path": "b.txt"}}
-        ]
-    },
-    {
-        "role": "user",
-        "content": [
-            {"type": "tool_result", "tool_use_id": "call_001", "content": "文件A内容"},
-            {"type": "tool_result", "tool_use_id": "call_002", "content": "文件B内容"}  # 合并添加
-        ]
-    }
-]
-```
-
-**说明**：这是最核心的场景——多工具并行调用后，所有 tool_result 合并到同一个 user 消息中。
-
----
-
-## 四、与 SessionStore 完整实现的关系
-
-### 4.1 数据流向
+### 6.2 数据流总览
 
 ```
-用户输入 / 工具调用
-        │
-        ▼
-┌─────────────────────────────────────┐
-│        save_turn() / save_tool_result()       │
-│        写入 JSONL 记录                          │
-└─────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────┐
-│        JSONL 文件存储                          │
-│        workspace/.sessions/agents/{id}/        │
-│        sessions/{session_id}.jsonl             │
-└─────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────┐
-│        load_session() → _rebuild_history()     │
-│        重建 API 消息列表                        │
-└─────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────┐
-│        API 调用 (guard_api_call)               │
-│        符合 Anthropic/OpenAI 格式要求           │
-└─────────────────────────────────────┘
-```
-
-### 4.2 写入阶段（save_tool_result）
-
-```python
-def save_tool_result(self, tool_use_id: str, name: str,
-                     tool_input: dict, result: str) -> None:
-    if not self.current_session_id:
-        return
-    ts = time.time()
-    # 先写入 tool_use 记录
-    self.append_transcript(self.current_session_id, {
-        "type": "tool_use",
-        "tool_use_id": tool_use_id,
-        "name": name,
-        "input": tool_input,
-        "ts": ts,
-    })
-    # 再写入 tool_result 记录
-    self.append_transcript(self.current_session_id, {
-        "type": "tool_result",
-        "tool_use_id": tool_use_id,
-        "content": result,
-        "ts": ts,
-    })
-```
-
-**关键点**：
-- `tool_use` 和 `tool_result` 作为**独立记录**写入
-- 两者通过 `tool_use_id` 关联
-- 时间戳相同，便于追踪
-
-### 4.3 读取阶段（_rebuild_history）
-
-重建时需要将独立的 JSONL 记录转换为符合 API 规范的消息结构：
-
-```
-JSONL 记录序列:
-  tool_use(call_001) → tool_use(call_002) → tool_result(call_001) → tool_result(call_002)
-
-重建后消息结构:
-  assistant: [tool_use(call_001), tool_use(call_002)]
-  user: [tool_result(call_001), tool_result(call_002)]
-```
-
-### 4.4 为什么需要复杂的判断条件
-
-1. **API 兼容性**：Anthropic API 要求消息严格交替，多个 tool_result 必须合并
-2. **数据完整性**：JSONL 可能损坏或被手动编辑，需要防御性检查
-3. **类型安全**：content 可能是字符串或列表，需要分别处理
-
----
-
-## 五、边界情况与错误处理
-
-### 5.1 JSONL 解析错误
-
-```python
-try:
-    record = json.loads(line)
-except json.JSONDecodeError:
-    continue  # 跳过无效行
-```
-
-### 5.2 类型字段缺失
-
-```python
-rtype = record.get("type")  # 使用 get 避免 KeyError
-```
-
-### 5.3 字段缺失处理
-
-```python
-result_block = {
-    "type": "tool_result",
-    "tool_use_id": record["tool_use_id"],  # 如果缺失会抛出 KeyError
-    "content": record["content"],
-}
-```
-
-**注意**：此处假设 JSONL 格式正确，依赖写入阶段的规范化。
-
----
-
-## 六、最佳实践
-
-### 6.1 添加调试日志
-
-```python
-def _rebuild_history(self, path: Path) -> list[dict]:
-    messages: list[dict] = []
-    # ...
-    
-    elif rtype == "tool_result":
-        # 调试：输出条件检查结果
-        conditions = {
-            "C1_messages_nonempty": bool(messages),
-            "C2_last_is_user": messages[-1]["role"] == "user" if messages else False,
-            "C3_content_is_list": isinstance(messages[-1]["content"], list) if messages else False,
-            # ...
-        }
-        if all(conditions.values()):
-            messages[-1]["content"].append(result_block)
-        else:
-            messages.append({"role": "user", "content": [result_block]})
-```
-
-### 6.2 单元测试覆盖
-
-```python
-def test_tool_result_merge():
-    """测试连续 tool_result 合并"""
-    store = SessionStore()
-    # 构造测试 JSONL 内容
-    # ...
-    messages = store._rebuild_history(test_path)
-    
-    # 验证：所有 tool_result 在同一个 user 消息中
-    assert len(messages) == 2  # assistant + user
-    assert messages[1]["role"] == "user"
-    assert len(messages[1]["content"]) == 2  # 两个 tool_result
-```
-
----
-
-## 七、总结
-
-### 7.1 条件判断的核心逻辑
-
-| 最终行为 | 触发条件 |
-|----------|----------|
-| **合并消息** | 前 6 个条件全部为 True |
-| **创建新消息** | 任意一个条件为 False |
-
-### 7.2 设计原则
-
-1. **防御性编程**：层层检查，避免异常
-2. **API 兼容**：符合 Anthropic 消息格式规范
-3. **数据安全**：即使 JSONL 损坏也能部分恢复
-
-### 7.3 与整体架构的关系
-
-```
-SessionStore
-├── 写入层：save_turn(), save_tool_result() → 独立 JSONL 记录
-├── 存储层：JSONL 文件 → 持久化
-└── 读取层：_rebuild_history() → API 消息重建
-         └── tool_result 判断条件 → 消息合并逻辑
+┌─────────────────────────────────────────────────────────────┐
+│                      agent_loop                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  for tool_call in tool_calls:                         │  │
+│  │      save_tool_result(id, name, input, result)        │  │
+│  │          ├─ append tool_use 记录                      │  │
+│  │          └─ append tool_result 记录                   │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     JSONL 文件                               │
+│  tool_use_1 → tool_result_1 → tool_use_2 → tool_result_2... │
+│  （交替写入）                                                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   _rebuild_history                           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  处理 tool_use_1 → 合并/创建 assistant                 │  │
+│  │  处理 tool_result_1 → C2=False → 创建 user            │  │
+│  │  处理 tool_use_2 → 创建新 assistant                    │  │
+│  │  处理 tool_result_2 → C2=False → 创建 user            │  │
+│  │  ...                                                   │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    重建后的 messages                         │
+│  [assistant, user, assistant, user, ...]                    │
+│  （交替出现）                                                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
